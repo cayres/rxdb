@@ -209,6 +209,15 @@ export function replicateGraphQL<RxDocType, CheckpointType>(
                 pullStream$.next('RESYNC');
             });
 
+            wsClient.on('closed', (event) => {
+                pullStream$.error(event);
+                graphqlReplicationState.cancel();
+            });
+        
+            wsClient.on('error', (error) => {
+                pullStream$.error(error);
+            });
+
             const query: any = ensureNotFalsy(pull.streamQueryBuilder)(mutateableClientState.headers);
 
             wsClient.subscribe(

@@ -8,12 +8,12 @@ import {
 import pkg from 'isomorphic-ws';
 const { WebSocket: IsomorphicWebSocket } = pkg;
 
-
 import {
-    first
-} from 'rxjs/operators';
-import {
-    firstValueFrom
+    filter,
+    first,
+    firstValueFrom,
+    interval,
+    race
 } from 'rxjs';
 
 import config, { describeParallel } from './config.ts';
@@ -67,6 +67,7 @@ import {
 import { ReplicationPushHandlerResult, RxDocumentData } from '../../plugins/core/index.mjs';
 import { HumanWithTimestampDocumentType } from '../../src/plugins/test-utils/schema-objects.ts';
 import { normalizeString } from '../../plugins/utils/index.mjs';
+import { startReplicationOnLeaderShip } from '../../plugins/replication/index.mjs';
 
 declare type WithDeleted<T> = T & { deleted: boolean; };
 
@@ -2888,6 +2889,109 @@ describe('replication-graphql.test.ts', () => {
 
                 c.database.close();
                 server.close();
+            });
+
+            it(`
+                #6515
+        
+                Given multiple clients using GraphQL replication
+                And using Websocket protocol
+                When the Websocket connection is closed
+                Then a close event should be published as error
+                And the graphql replication state should be canceled
+                `, async () => {
+                let replicationCanceled = false;
+
+                const server = await SpawnServer.spawn();
+                server.requireHeader('token', 'Bearer token');
+
+                const { db, replication } = await rxdbInitialize();
+                const { db: db2, replication: replication2 } = await rxdbInitialize();
+
+
+                await db.humans.upsert(schemaObjects.humanWithTimestampData());
+
+                await firstValueFrom(race(replication.sent$, interval(1000)));
+                const [remoteEvents, errors] = await Promise.all([
+                    firstValueFrom(race(replication.remoteEvents$, replication2.remoteEvents$, interval(1000))),
+                    firstValueFrom(race(replication.error$, replication2.error$, interval(1000)))
+                ]);
+                await firstValueFrom(race(replication2.received$, interval(1000)));
+
+                let numHumans = await db.humans.count({}).exec();
+                let numHumans2 = await db2.humans.count({}).exec();
+
+                assert.equal(server.getDocuments().length, numHumans);
+                assert.equal(numHumans2, numHumans);
+                assert.ok(!errors, 'There is Errors');
+                assert.ok(remoteEvents, 'There is no remote events');
+
+                server.subServer.dispose();
+
+                const closedEvent = await firstValueFrom(race(
+                    replication.error$.pipe(filter((error: any) => error.type === 'close')),
+                    replication2.error$.pipe(filter((error: any) => error.type === 'close')),
+                    interval(1000)
+                ));
+
+                assert.ok(closedEvent, 'There is no errors');
+                assert.ok(replicationCanceled, 'Replication is not canceled');
+
+                await db.humans.upsert(schemaObjects.humanWithTimestampData());
+
+                wait(1000);
+
+                numHumans = await db.humans.count({}).exec();
+                numHumans2 = await db2.humans.count({}).exec();
+
+                assert.notEqual(server.getDocuments().length, numHumans);
+                assert.notEqual(numHumans2, numHumans);
+
+                async function rxdbInitialize() {
+                    const rxdb = await createRxDatabase({
+                        name: randomToken(10),
+                        storage: config.storage.getStorage(),
+                        ignoreDuplicate: true,
+                    });
+
+                    const collection = await rxdb.addCollections({
+                        humans: {
+                            schema: schemas.humanWithTimestampAllIndex,
+                        },
+                    });
+
+                    const replicationState = replicateGraphQL({
+                        replicationIdentifier: server.url.http ?? '',
+                        collection: collection.humans,
+                        url: server.url,
+                        pull: {
+                            batchSize,
+                            queryBuilder: pullQueryBuilder,
+                            streamQueryBuilder: pullStreamQueryBuilder,
+                            includeWsHeaders: true,
+                        },
+                        headers: {
+                            token: 'Bearer token',
+                        },
+                        push: {
+                            batchSize,
+                            queryBuilder: pushQueryBuilder,
+                        },
+                        live: true,
+                        deletedField: 'deleted',
+                        autoStart: false,
+                        waitForLeadership: true,
+                    });
+
+                    replicationState.onCancel.push(() => {
+                        replicationCanceled = true;
+                    });
+
+                    await startReplicationOnLeaderShip(true, replicationState);
+
+                    await replicationState.start();
+                    return { db: rxdb, replication: replicationState };
+                }
             });
         });
     });
